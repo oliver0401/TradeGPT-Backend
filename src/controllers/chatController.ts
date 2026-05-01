@@ -1,22 +1,31 @@
 import type { Request, Response } from "express";
-import mongoose from "mongoose";
+import { In } from "typeorm";
 import OpenAI from "openai";
-import { Conversation } from "../models/Conversation.js";
-import { ChatMessage } from "../models/ChatMessage.js";
+import { AppDataSource } from "../setup";
+import { ConversationEntity } from "../entities/conversation.entity";
+import { ChatMessageEntity } from "../entities/chatMessage.entity";
 import {
   isTradeModeId,
   TRADE_MODES,
   type TradeModeId,
-} from "../utils/tradeModes.js";
+} from "../utils/tradeModes";
 import {
   buildModelFallbackChain,
   isSearchPreviewModel,
   routeUserMessage,
-} from "../utils/modelRouter.js";
-import { buildOpenAIMessagesFromStoredThread } from "../utils/chatThread.js";
-import { generateFollowUpQuestions } from "../utils/followUpSuggestionGenerator.js";
+} from "../utils/modelRouter";
+import { buildOpenAIMessagesFromStoredThread } from "../utils/chatThread";
+import { generateFollowUpQuestions } from "../utils/followUpSuggestionGenerator";
 
 const FOLLOW_UP_TIMEOUT_MS = Number(process.env.FOLLOW_UP_TIMEOUT_MS ?? 60000);
+
+const convRepo = () => AppDataSource.getRepository(ConversationEntity);
+const msgRepo = () => AppDataSource.getRepository(ChatMessageEntity);
+
+function isValidId(id: string): boolean {
+  const n = Number(id);
+  return Number.isInteger(n) && n > 0;
+}
 
 function afterDelay(ms: number): Promise<"timeout"> {
   return new Promise((resolve) => {
@@ -30,6 +39,16 @@ function getOpenAI(): OpenAI | null {
   return new OpenAI({ apiKey: key });
 }
 
+function parseSuggestions(raw?: string | null): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
 export function listModes(_req: Request, res: Response): void {
   res.json({ modes: TRADE_MODES });
 }
@@ -37,51 +56,28 @@ export function listModes(_req: Request, res: Response): void {
 export async function listConversations(req: Request, res: Response): Promise<void> {
   try {
     const userId = req.userId!;
-    const uid = new mongoose.Types.ObjectId(userId);
-    const msgCollection = ChatMessage.collection.collectionName;
 
-    const list = await Conversation.aggregate<{
-      _id: mongoose.Types.ObjectId;
-      title: string;
-      mode: TradeModeId;
-      updatedAt: Date;
-      messageCount: number;
-    }>([
-      { $match: { userId: uid } },
-      { $sort: { updatedAt: -1 } },
-      { $limit: 50 },
-      {
-        $lookup: {
-          from: msgCollection,
-          let: { cid: "$_id" },
-          pipeline: [
-            { $match: { $expr: { $eq: ["$conversationId", "$$cid"] } } },
-            { $count: "n" },
-          ],
-          as: "cnt",
-        },
-      },
-      {
-        $addFields: {
-          messageCount: {
-            $cond: {
-              if: { $gt: [{ $size: "$cnt" }, 0] },
-              then: { $arrayElemAt: ["$cnt.n", 0] },
-              else: 0,
-            },
-          },
-        },
-      },
-      { $project: { cnt: 0 } },
-    ]).exec();
+    const list = await convRepo()
+      .createQueryBuilder("conv")
+      .leftJoin(ChatMessageEntity, "msg", "msg.conversationId = conv.id")
+      .select("conv.id", "id")
+      .addSelect("conv.title", "title")
+      .addSelect("conv.mode", "mode")
+      .addSelect("conv.updatedAt", "updatedAt")
+      .addSelect("COUNT(msg.id)", "messageCount")
+      .where("conv.userId = :userId", { userId })
+      .groupBy("conv.id")
+      .orderBy("conv.updatedAt", "DESC")
+      .limit(50)
+      .getRawMany();
 
     res.json({
       conversations: list.map((c) => ({
-        id: c._id.toString(),
+        id: String(c.id),
         title: c.title,
         mode: c.mode,
         updatedAt: c.updatedAt,
-        messageCount: c.messageCount,
+        messageCount: Number(c.messageCount) || 0,
       })),
     });
   } catch (e) {
@@ -98,13 +94,15 @@ export async function createConversation(req: Request, res: Response): Promise<v
       res.status(400).json({ error: "Invalid mode" });
       return;
     }
-    const conv = await Conversation.create({
-      userId,
-      title: "New chat",
-      mode: modeRaw as TradeModeId,
-    });
+    const conv = await convRepo().save(
+      convRepo().create({
+        userId,
+        title: "New chat",
+        mode: modeRaw as TradeModeId,
+      })
+    );
     res.status(201).json({
-      id: conv._id.toString(),
+      id: String(conv.id),
       title: conv.title,
       mode: conv.mode,
     });
@@ -118,33 +116,33 @@ export async function getConversation(req: Request, res: Response): Promise<void
   try {
     const userId = req.userId!;
     const id = req.params.id;
-    if (!mongoose.Types.ObjectId.isValid(id)) {
+    if (!isValidId(id)) {
       res.status(400).json({ error: "Invalid conversation id" });
       return;
     }
-    const conv = await Conversation.findOne({ _id: id, userId }).lean().exec();
+    const conv = await convRepo().findOne({ where: { id: Number(id), userId } });
     if (!conv) {
       res.status(404).json({ error: "Conversation not found" });
       return;
     }
-    const messages = await ChatMessage.find({ conversationId: conv._id })
-      .sort({ createdAt: 1 })
-      .lean()
-      .exec();
+    const messages = await msgRepo().find({
+      where: { conversationId: conv.id },
+      order: { createdAt: "ASC" },
+    });
     res.json({
-      id: conv._id.toString(),
+      id: String(conv.id),
       title: conv.title,
       mode: conv.mode,
       messages: messages.map((m) => ({
-        id: m._id.toString(),
+        id: String(m.id),
         role: m.role,
         content: m.content,
         createdAt: m.createdAt,
         ...(m.role === "user" && m.tradeMode
           ? { tradeMode: m.tradeMode }
           : {}),
-        ...(m.suggestedQuestions?.length
-          ? { suggestedQuestions: m.suggestedQuestions }
+        ...(parseSuggestions(m.suggestedQuestions).length
+          ? { suggestedQuestions: parseSuggestions(m.suggestedQuestions) }
           : {}),
       })),
     });
@@ -158,7 +156,7 @@ export async function patchConversation(req: Request, res: Response): Promise<vo
   try {
     const userId = req.userId!;
     const id = req.params.id;
-    if (!mongoose.Types.ObjectId.isValid(id)) {
+    if (!isValidId(id)) {
       res.status(400).json({ error: "Invalid conversation id" });
       return;
     }
@@ -171,51 +169,44 @@ export async function patchConversation(req: Request, res: Response): Promise<vo
       res.status(400).json({ error: "Invalid mode" });
       return;
     }
-    const conv = await Conversation.findOneAndUpdate(
-      { _id: id, userId },
-      { mode: modeRaw as TradeModeId },
-      { new: true }
-    )
-      .lean()
-      .exec();
+
+    const conv = await convRepo().findOne({ where: { id: Number(id), userId } });
     if (!conv) {
       res.status(404).json({ error: "Conversation not found" });
       return;
     }
-    res.json({ id: conv._id.toString(), mode: conv.mode });
+    conv.mode = modeRaw as TradeModeId;
+    await convRepo().save(conv);
+    res.json({ id: String(conv.id), mode: conv.mode });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Failed to update conversation" });
   }
 }
 
-/**
- * Delete a user message and all messages after it (by conversation order).
- * Used when editing a prior user message (ChatGPT-style).
- */
 export async function rollbackFromMessage(req: Request, res: Response): Promise<void> {
   try {
     const userId = req.userId!;
     const convId = req.params.id;
     const fromMessageId = String(req.body?.fromMessageId ?? "");
 
-    if (!mongoose.Types.ObjectId.isValid(convId) || !mongoose.Types.ObjectId.isValid(fromMessageId)) {
+    if (!isValidId(convId) || !isValidId(fromMessageId)) {
       res.status(400).json({ error: "Invalid id" });
       return;
     }
 
-    const conv = await Conversation.findOne({ _id: convId, userId }).exec();
+    const conv = await convRepo().findOne({ where: { id: Number(convId), userId } });
     if (!conv) {
       res.status(404).json({ error: "Conversation not found" });
       return;
     }
 
-    const msgs = await ChatMessage.find({ conversationId: conv._id })
-      .sort({ createdAt: 1 })
-      .lean()
-      .exec();
+    const msgs = await msgRepo().find({
+      where: { conversationId: conv.id },
+      order: { createdAt: "ASC" },
+    });
 
-    const idx = msgs.findIndex((m) => m._id.toString() === fromMessageId);
+    const idx = msgs.findIndex((m) => String(m.id) === fromMessageId);
     if (idx === -1) {
       res.status(404).json({ error: "Message not found" });
       return;
@@ -226,10 +217,10 @@ export async function rollbackFromMessage(req: Request, res: Response): Promise<
       return;
     }
 
-    const toDelete = msgs.slice(idx).map((m) => m._id);
-    await ChatMessage.deleteMany({ _id: { $in: toDelete } });
+    const toDelete = msgs.slice(idx).map((m) => m.id);
+    await msgRepo().delete(toDelete);
     conv.updatedAt = new Date();
-    await conv.save();
+    await convRepo().save(conv);
 
     res.json({ ok: true, removed: toDelete.length });
   } catch (e) {
@@ -242,16 +233,17 @@ export async function deleteConversation(req: Request, res: Response): Promise<v
   try {
     const userId = req.userId!;
     const id = req.params.id;
-    if (!mongoose.Types.ObjectId.isValid(id)) {
+    if (!isValidId(id)) {
       res.status(400).json({ error: "Invalid conversation id" });
       return;
     }
-    const conv = await Conversation.findOneAndDelete({ _id: id, userId }).lean().exec();
+    const conv = await convRepo().findOne({ where: { id: Number(id), userId } });
     if (!conv) {
       res.status(404).json({ error: "Conversation not found" });
       return;
     }
-    await ChatMessage.deleteMany({ conversationId: conv._id });
+    await msgRepo().delete({ conversationId: conv.id });
+    await convRepo().remove(conv);
     res.status(204).send();
   } catch (e) {
     console.error(e);
@@ -262,22 +254,20 @@ export async function deleteConversation(req: Request, res: Response): Promise<v
 export async function deleteAllConversations(req: Request, res: Response): Promise<void> {
   try {
     const userId = req.userId!;
-    const convs = await Conversation.find({ userId }).select("_id").lean().exec();
-    const ids = convs.map((c) => c._id);
+    const convs = await convRepo().find({ where: { userId }, select: ["id"] });
+    const ids = convs.map((c) => c.id);
 
     if (ids.length === 0) {
       res.json({ deletedConversations: 0, deletedMessages: 0 });
       return;
     }
 
-    const [msgResult, convResult] = await Promise.all([
-      ChatMessage.deleteMany({ conversationId: { $in: ids } }),
-      Conversation.deleteMany({ _id: { $in: ids } }),
-    ]);
+    const msgResult = await msgRepo().delete({ conversationId: In(ids) });
+    const convResult = await convRepo().delete({ id: In(ids) });
 
     res.json({
-      deletedConversations: convResult.deletedCount ?? ids.length,
-      deletedMessages: msgResult.deletedCount ?? 0,
+      deletedConversations: convResult.affected ?? ids.length,
+      deletedMessages: msgResult.affected ?? 0,
     });
   } catch (e) {
     console.error(e);
@@ -288,7 +278,7 @@ export async function deleteAllConversations(req: Request, res: Response): Promi
 export async function streamMessage(req: Request, res: Response): Promise<void> {
   const userId = req.userId!;
   const id = req.params.id;
-  if (!mongoose.Types.ObjectId.isValid(id)) {
+  if (!isValidId(id)) {
     res.status(400).json({ error: "Invalid conversation id" });
     return;
   }
@@ -306,7 +296,7 @@ export async function streamMessage(req: Request, res: Response): Promise<void> 
   }
 
   try {
-    const conv = await Conversation.findOne({ _id: id, userId }).exec();
+    const conv = await convRepo().findOne({ where: { id: Number(id), userId } });
     if (!conv) {
       res.status(404).json({ error: "Conversation not found" });
       return;
@@ -317,26 +307,28 @@ export async function streamMessage(req: Request, res: Response): Promise<void> 
       return;
     }
 
-    await ChatMessage.create({
-      conversationId: conv._id,
-      role: "user",
-      content,
-      tradeMode: conv.mode,
+    await msgRepo().save(
+      msgRepo().create({
+        conversationId: conv.id,
+        role: "user",
+        content,
+        tradeMode: conv.mode,
+      })
+    );
+
+    const prior = await msgRepo().find({
+      where: { conversationId: conv.id },
+      order: { createdAt: "ASC", id: "ASC" },
     });
 
-    const prior = await ChatMessage.find({ conversationId: conv._id })
-      .sort({ createdAt: 1, _id: 1 })
-      .lean()
-      .exec();
-
-    const openaiMessages = buildOpenAIMessagesFromStoredThread(conv.mode, prior);
+    const openaiMessages = buildOpenAIMessagesFromStoredThread(conv.mode as TradeModeId, prior);
 
     if (conv.title === "New chat" && content.length > 0) {
-      conv.title = content.slice(0, 60) + (content.length > 60 ? "…" : "");
-      await conv.save();
+      conv.title = content.slice(0, 60) + (content.length > 60 ? "\u2026" : "");
+      await convRepo().save(conv);
     } else {
       conv.updatedAt = new Date();
-      await conv.save();
+      await convRepo().save(conv);
     }
 
     const route = await routeUserMessage(openai, {
@@ -401,11 +393,13 @@ export async function streamMessage(req: Request, res: Response): Promise<void> 
       throw lastModelError ?? new Error("No chat model succeeded");
     }
 
-    const assistantDoc = await ChatMessage.create({
-      conversationId: conv._id,
-      role: "assistant",
-      content: full || "(No response)",
-    });
+    const assistantDoc = await msgRepo().save(
+      msgRepo().create({
+        conversationId: conv.id,
+        role: "assistant",
+        content: full || "(No response)",
+      })
+    );
 
     const transcript = prior
       .filter((m) => m.role === "user" || m.role === "assistant")
@@ -425,7 +419,7 @@ export async function streamMessage(req: Request, res: Response): Promise<void> 
     try {
       const suggestionResult = await Promise.race([
         generateFollowUpQuestions(openai, {
-          tradeMode: conv.mode,
+          tradeMode: conv.mode as TradeModeId,
           transcript,
         }),
         afterDelay(FOLLOW_UP_TIMEOUT_MS),
@@ -446,13 +440,12 @@ export async function streamMessage(req: Request, res: Response): Promise<void> 
       }
 
       if (suggestedQuestions.length > 0) {
-        await ChatMessage.updateOne(
-          { _id: assistantDoc._id },
-          { suggestedQuestions }
+        await msgRepo().update(
+          { id: assistantDoc.id },
+          { suggestedQuestions: JSON.stringify(suggestedQuestions) }
         );
       }
     } catch {
-      // non-critical — suggestions are best-effort
       followUpNotice =
         "Suggested questions were automatically withdrawn because generation failed.";
     }
@@ -463,7 +456,7 @@ export async function streamMessage(req: Request, res: Response): Promise<void> 
         title: conv.title,
         model: usedModel,
         usedWebSearch,
-        assistantMessageId: assistantDoc._id.toString(),
+        assistantMessageId: String(assistantDoc.id),
         suggestedQuestions,
         followUpStatus,
         ...(followUpStatus === "withdrawn" && followUpNotice

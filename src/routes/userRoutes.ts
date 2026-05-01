@@ -1,6 +1,6 @@
 import { Router } from "express";
-import { getNotificationPrefs, updateNotificationPrefs } from "../controllers/userController.js";
-import { requireAuth } from "../middleware/requireAuth.js";
+import { getNotificationPrefs, updateNotificationPrefs } from "../controllers/userController";
+import { requireAuth } from "../middleware/requireAuth";
 
 export const userRouter = Router();
 

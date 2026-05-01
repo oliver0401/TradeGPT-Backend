@@ -6,8 +6,8 @@ import {
   paymentWebhook,
   getPaymentStatus,
   checkPaymentLogs,
-} from "../controllers/paymentController.js";
-import { requireAuth } from "../middleware/requireAuth.js";
+} from "../controllers/paymentController";
+import { requireAuth } from "../middleware/requireAuth";
 
 export const paymentRouter = Router();
 

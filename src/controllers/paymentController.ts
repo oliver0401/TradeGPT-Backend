@@ -1,10 +1,15 @@
 import type { Request, Response } from "express";
-import { Payment, type PaymentNetwork, type PaymentToken } from "../models/Payment.js";
-import { User } from "../models/User.js";
-import { getSubscriptionStatus } from "../utils/subscription.js";
+import { In } from "typeorm";
+import { AppDataSource } from "../setup";
+import { PaymentEntity, type PaymentNetwork, type PaymentToken } from "../entities/payment.entity";
+import { UserEntity, PaymentMethod } from "../entities/user.entity";
+import { getSubscriptionStatus } from "../utils/subscription";
 
 const PRO_PRICE = 1;
 const PAYMENT_EXPIRY_MS = 60 * 60 * 1000; // 1 hour
+
+const paymentRepo = () => AppDataSource.getRepository(PaymentEntity);
+const userRepo = () => AppDataSource.getRepository(UserEntity);
 
 type NetworkConfig = {
   id: PaymentNetwork;
@@ -77,19 +82,19 @@ function getServerBaseUrl(req: Request): string {
   return fallback;
 }
 
-/**
- * GET /api/payment/networks
- * Returns available networks and tokens (only those with a configured address).
- */
 export function listNetworks(_req: Request, res: Response): void {
   res.json({ networks: getAvailableNetworks(), price: PRO_PRICE });
 }
 
 async function reconcileUserPayments(userId: string): Promise<boolean> {
-  const recent = await Payment.find({
-    userId,
-    status: { $in: ["pending", "confirming", "expired"] },
-  }).sort({ createdAt: -1 }).limit(10);
+  const recent = await paymentRepo().find({
+    where: {
+      userId,
+      status: In(["pending", "confirming", "expired"]),
+    },
+    order: { createdAt: "DESC" },
+    take: 10,
+  });
 
   for (const payment of recent) {
     try {
@@ -97,7 +102,7 @@ async function reconcileUserPayments(userId: string): Promise<boolean> {
         `https://api.cryptapi.io/${payment.ticker}/logs/?callback=${encodeURIComponent(payment.callbackUrl)}`,
         { signal: AbortSignal.timeout(8000) },
       );
-      const logsData = await logsRes.json();
+      const logsData = await logsRes.json() as Record<string, any>;
       if (logsData.status !== "success" || !logsData.callbacks?.length) continue;
 
       for (const cb of logsData.callbacks) {
@@ -109,8 +114,8 @@ async function reconcileUserPayments(userId: string): Promise<boolean> {
           payment.txidIn = cb.txid_in || payment.txidIn;
           payment.valueCoin = cb.value_coin || payment.valueCoin;
           if (cb.uuid) payment.cryptapiUuid = cb.uuid;
-          await payment.save();
-          await User.findByIdAndUpdate(userId, { plan: "pro" });
+          await paymentRepo().save(payment);
+          await userRepo().update({ uuid: userId }, { paymentMethod: PaymentMethod.PRO });
           console.log(`[Payment] RECONCILED for user ${userId}: ${cb.value_coin} ${payment.token.toUpperCase()} (${payment.network})`);
           return true;
         }
@@ -120,23 +125,19 @@ async function reconcileUserPayments(userId: string): Promise<boolean> {
   return false;
 }
 
-/**
- * POST /api/payment/create-checkout
- * Body: { network: "eth"|"bsc"|"tron"|"sol", token: "usdt"|"usdc" }
- */
 export async function createCheckout(req: Request, res: Response): Promise<void> {
   try {
     const userId = req.userId!;
     const network = (req.body?.network ?? "eth") as PaymentNetwork;
     const token = (req.body?.token ?? "usdt") as PaymentToken;
 
-    const user = await User.findById(userId);
+    const user = await userRepo().findOne({ where: { uuid: userId } });
     if (!user) { res.status(404).json({ error: "User not found" }); return; }
-    if (user.plan === "pro") { res.status(400).json({ error: "Already on Pro plan" }); return; }
+    if (user.paymentMethod === PaymentMethod.PRO) { res.status(400).json({ error: "Already on Pro plan" }); return; }
 
     const reconciled = await reconcileUserPayments(userId);
     if (reconciled) {
-      const updated = await User.findById(userId);
+      const updated = await userRepo().findOne({ where: { uuid: userId } });
       res.json({ confirmed: true, subscription: updated ? getSubscriptionStatus(updated) : undefined });
       return;
     }
@@ -147,10 +148,12 @@ export async function createCheckout(req: Request, res: Response): Promise<void>
       return;
     }
 
-    await Payment.updateMany(
-      { userId, status: "pending" },
-      { $set: { status: "expired" } },
-    );
+    await paymentRepo()
+      .createQueryBuilder()
+      .update(PaymentEntity)
+      .set({ status: "expired" })
+      .where("userId = :userId AND status = :status", { userId, status: "pending" })
+      .execute();
 
     const baseUrl = getServerBaseUrl(req);
     const callbackUrl = `${baseUrl}/api/payment/webhook?user_id=${userId}`;
@@ -162,7 +165,7 @@ export async function createCheckout(req: Request, res: Response): Promise<void>
       `&pending=1&confirmations=1&post=0&json=0&multi_token=1&convert=0`;
 
     const createRes = await fetch(createUrl);
-    const createData = await createRes.json();
+    const createData = await createRes.json() as Record<string, any>;
 
     if (createData.status !== "success" || !createData.address_in) {
       console.error("CryptAPI create error:", createData);
@@ -170,23 +173,25 @@ export async function createCheckout(req: Request, res: Response): Promise<void>
       return;
     }
 
-    const payment = await Payment.create({
-      userId,
-      network,
-      token,
-      ticker: resolved.ticker,
-      amount: PRO_PRICE,
-      addressIn: createData.address_in,
-      addressOut: resolved.address,
-      callbackUrl,
-      status: "pending",
-      expiresAt: new Date(Date.now() + PAYMENT_EXPIRY_MS),
-    });
+    const payment = await paymentRepo().save(
+      paymentRepo().create({
+        userId,
+        network,
+        token,
+        ticker: resolved.ticker,
+        amount: PRO_PRICE,
+        addressIn: createData.address_in,
+        addressOut: resolved.address,
+        callbackUrl,
+        status: "pending",
+        expiresAt: new Date(Date.now() + PAYMENT_EXPIRY_MS),
+      })
+    );
 
     const qrCode = await fetchQr(resolved.ticker, createData.address_in);
 
     res.json({
-      paymentId: payment._id.toString(),
+      paymentId: String(payment.id),
       addressIn: createData.address_in,
       amount: PRO_PRICE,
       network,
@@ -207,26 +212,25 @@ async function fetchQr(ticker: string, address: string): Promise<string | null> 
     const r = await fetch(
       `https://api.cryptapi.io/${ticker}/qrcode/?address=${address}&value=${PRO_PRICE}&size=300`
     );
-    const d = await r.json();
+    const d = await r.json() as Record<string, any>;
     return d.status === "success" ? d.qr_code : null;
   } catch {
     return null;
   }
 }
 
-/**
- * POST /api/payment/cancel/:id
- * Marks a pending payment as expired so a fresh address is generated next time.
- */
 export async function cancelPayment(req: Request, res: Response): Promise<void> {
   try {
     const userId = req.userId!;
-    const payment = await Payment.findOne({ _id: req.params.id, userId });
+    const paymentId = Number(req.params.id);
+    if (isNaN(paymentId)) { res.status(400).json({ error: "Invalid payment id" }); return; }
+
+    const payment = await paymentRepo().findOne({ where: { id: paymentId, userId } });
     if (!payment) { res.status(404).json({ error: "Payment not found" }); return; }
 
     if (payment.status === "pending" || payment.status === "confirming") {
       payment.status = "expired";
-      await payment.save();
+      await paymentRepo().save(payment);
     }
 
     res.json({ ok: true });
@@ -236,9 +240,6 @@ export async function cancelPayment(req: Request, res: Response): Promise<void> 
   }
 }
 
-/**
- * GET /api/payment/webhook  (called by CryptAPI)
- */
 export async function paymentWebhook(req: Request, res: Response): Promise<void> {
   try {
     const { user_id, uuid, address_in, txid_in, txid_out, confirmations, value_coin, pending: isPending } =
@@ -246,15 +247,16 @@ export async function paymentWebhook(req: Request, res: Response): Promise<void>
 
     if (!user_id || !address_in) { res.status(200).send("*ok*"); return; }
 
-    const payment = await Payment.findOne({
-      userId: user_id,
-      addressIn: address_in,
-      status: { $in: ["pending", "confirming", "expired"] },
-    });
+    const payment = await paymentRepo()
+      .createQueryBuilder("p")
+      .where("p.userId = :userId", { userId: user_id })
+      .andWhere("p.addressIn = :addressIn", { addressIn: address_in })
+      .andWhere("p.status IN (:...statuses)", { statuses: ["pending", "confirming", "expired"] })
+      .getOne();
     if (!payment) { res.status(200).send("*ok*"); return; }
 
     if (uuid) {
-      const dup = await Payment.findOne({ cryptapiUuid: uuid, status: "confirmed" });
+      const dup = await paymentRepo().findOne({ where: { cryptapiUuid: uuid, status: "confirmed" as any } });
       if (dup) { res.status(200).send("*ok*"); return; }
     }
 
@@ -266,19 +268,19 @@ export async function paymentWebhook(req: Request, res: Response): Promise<void>
 
     if (String(isPending) === "1") {
       payment.status = "confirming";
-      await payment.save();
+      await paymentRepo().save(payment);
       console.log(`[Payment] Pending ${payment.token.toUpperCase()} tx for user ${user_id} on ${payment.network}: ${value_coin}`);
     } else {
       const received = parseFloat(value_coin || "0");
       if (received >= PRO_PRICE * 0.98) {
         payment.status = "confirmed";
         payment.confirmedAt = new Date();
-        await payment.save();
-        await User.findByIdAndUpdate(user_id, { plan: "pro" });
+        await paymentRepo().save(payment);
+        await userRepo().update({ uuid: user_id }, { paymentMethod: PaymentMethod.PRO });
         console.log(`[Payment] CONFIRMED for user ${user_id}: ${value_coin} ${payment.token.toUpperCase()} (${payment.network}) -> Pro`);
       } else {
         payment.status = "confirming";
-        await payment.save();
+        await paymentRepo().save(payment);
         console.log(`[Payment] Partial for user ${user_id}: ${value_coin} of ${PRO_PRICE}`);
       }
     }
@@ -290,22 +292,22 @@ export async function paymentWebhook(req: Request, res: Response): Promise<void>
   }
 }
 
-/**
- * GET /api/payment/status/:id
- */
 export async function getPaymentStatus(req: Request, res: Response): Promise<void> {
   try {
     const userId = req.userId!;
-    const payment = await Payment.findOne({ _id: req.params.id, userId });
+    const paymentId = Number(req.params.id);
+    if (isNaN(paymentId)) { res.status(400).json({ error: "Invalid payment id" }); return; }
+
+    const payment = await paymentRepo().findOne({ where: { id: paymentId, userId } });
     if (!payment) { res.status(404).json({ error: "Payment not found" }); return; }
 
     if (payment.status === "pending" && payment.expiresAt < new Date()) {
       payment.status = "expired";
-      await payment.save();
+      await paymentRepo().save(payment);
     }
 
     const result: Record<string, unknown> = {
-      paymentId: payment._id.toString(),
+      paymentId: String(payment.id),
       status: payment.status,
       amount: payment.amount,
       network: payment.network,
@@ -315,7 +317,7 @@ export async function getPaymentStatus(req: Request, res: Response): Promise<voi
     };
 
     if (payment.status === "confirmed") {
-      const user = await User.findById(userId);
+      const user = await userRepo().findOne({ where: { uuid: userId } });
       if (user) result.subscription = getSubscriptionStatus(user);
     }
 
@@ -326,13 +328,13 @@ export async function getPaymentStatus(req: Request, res: Response): Promise<voi
   }
 }
 
-/**
- * GET /api/payment/check-logs/:id
- */
 export async function checkPaymentLogs(req: Request, res: Response): Promise<void> {
   try {
     const userId = req.userId!;
-    const payment = await Payment.findOne({ _id: req.params.id, userId });
+    const paymentId = Number(req.params.id);
+    if (isNaN(paymentId)) { res.status(400).json({ error: "Invalid payment id" }); return; }
+
+    const payment = await paymentRepo().findOne({ where: { id: paymentId, userId } });
     if (!payment) { res.status(404).json({ error: "Payment not found" }); return; }
 
     if (payment.status === "confirmed") {
@@ -343,7 +345,7 @@ export async function checkPaymentLogs(req: Request, res: Response): Promise<voi
     const logsRes = await fetch(
       `https://api.cryptapi.io/${payment.ticker}/logs/?callback=${encodeURIComponent(payment.callbackUrl)}`
     );
-    const logsData = await logsRes.json();
+    const logsData = await logsRes.json() as Record<string, any>;
 
     if (logsData.status !== "success" || !logsData.callbacks?.length) {
       res.json({ status: payment.status, callbacks: 0 });
@@ -360,12 +362,12 @@ export async function checkPaymentLogs(req: Request, res: Response): Promise<voi
         payment.txidIn = cb.txid_in || payment.txidIn;
         payment.valueCoin = cb.value_coin || payment.valueCoin;
         if (cb.uuid) payment.cryptapiUuid = cb.uuid;
-        await payment.save();
+        await paymentRepo().save(payment);
 
-        await User.findByIdAndUpdate(userId, { plan: "pro" });
+        await userRepo().update({ uuid: userId }, { paymentMethod: PaymentMethod.PRO });
         console.log(`[Payment] CONFIRMED via logs for user ${userId}: ${cb.value_coin} ${payment.token.toUpperCase()} (${payment.network})`);
 
-        const user = await User.findById(userId);
+        const user = await userRepo().findOne({ where: { uuid: userId } });
         res.json({ status: "confirmed", subscription: user ? getSubscriptionStatus(user) : undefined });
         return;
       }
@@ -374,7 +376,7 @@ export async function checkPaymentLogs(req: Request, res: Response): Promise<voi
         payment.status = "confirming";
         payment.txidIn = cb.txid_in || payment.txidIn;
         payment.valueCoin = cb.value_coin || payment.valueCoin;
-        await payment.save();
+        await paymentRepo().save(payment);
       }
     }
 

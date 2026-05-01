@@ -1,10 +1,10 @@
 import express from "express";
 import cors from "cors";
-import { authRouter } from "./routes/authRoutes.js";
-import { chatRouter } from "./routes/chatRoutes.js";
-import { subscriptionRouter } from "./routes/subscriptionRoutes.js";
-import { paymentRouter } from "./routes/paymentRoutes.js";
-import { userRouter } from "./routes/userRoutes.js";
+import { authRouter } from "./routes/authRoutes";
+import { chatRouter } from "./routes/chatRoutes";
+import { subscriptionRouter } from "./routes/subscriptionRoutes";
+import { paymentRouter } from "./routes/paymentRoutes";
+import { userRouter } from "./routes/userRoutes";
 
 export function createApp() {
   const app = express();

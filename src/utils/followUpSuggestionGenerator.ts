@@ -1,6 +1,6 @@
 import type OpenAI from "openai";
-import type { TradeModeId } from "./tradeModes.js";
-import { TRADE_MODES } from "./tradeModes.js";
+import type { TradeModeId } from "./tradeModes";
+import { TRADE_MODES } from "./tradeModes";
 
 const MAX_MESSAGES = 8;
 const MAX_CHARS_PER_MESSAGE = 2000;

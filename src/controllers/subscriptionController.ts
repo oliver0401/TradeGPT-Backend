@@ -1,10 +1,13 @@
 import type { Request, Response } from "express";
-import { User } from "../models/User.js";
-import { getSubscriptionStatus } from "../utils/subscription.js";
+import { AppDataSource } from "../setup";
+import { UserEntity } from "../entities/user.entity";
+import { getSubscriptionStatus } from "../utils/subscription";
+
+const userRepo = () => AppDataSource.getRepository(UserEntity);
 
 export async function getMySubscription(req: Request, res: Response): Promise<void> {
   try {
-    const user = await User.findById(req.userId);
+    const user = await userRepo().findOne({ where: { uuid: req.userId! } });
     if (!user) {
       res.status(404).json({ error: "User not found" });
       return;

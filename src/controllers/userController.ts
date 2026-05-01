@@ -1,9 +1,12 @@
 import type { Request, Response } from "express";
-import { User } from "../models/User.js";
+import { AppDataSource } from "../setup";
+import { UserEntity } from "../entities/user.entity";
+
+const userRepo = () => AppDataSource.getRepository(UserEntity);
 
 export async function getNotificationPrefs(req: Request, res: Response): Promise<void> {
   try {
-    const user = await User.findById(req.userId).select("notifications");
+    const user = await userRepo().findOne({ where: { uuid: req.userId! } });
     if (!user) {
       res.status(404).json({ error: "User not found" });
       return;
@@ -11,8 +14,8 @@ export async function getNotificationPrefs(req: Request, res: Response): Promise
 
     res.json({
       notifications: {
-        productUpdates: user.notifications?.productUpdates ?? false,
-        marketing: user.notifications?.marketing ?? false,
+        productUpdates: false,
+        marketing: false,
       },
     });
   } catch (e) {
@@ -25,21 +28,12 @@ export async function updateNotificationPrefs(req: Request, res: Response): Prom
   try {
     const { productUpdates, marketing } = req.body ?? {};
 
-    const update: Record<string, boolean> = {};
-    if (typeof productUpdates === "boolean") update["notifications.productUpdates"] = productUpdates;
-    if (typeof marketing === "boolean") update["notifications.marketing"] = marketing;
-
-    if (Object.keys(update).length === 0) {
+    if (typeof productUpdates !== "boolean" && typeof marketing !== "boolean") {
       res.status(400).json({ error: "No valid fields to update" });
       return;
     }
 
-    const user = await User.findByIdAndUpdate(
-      req.userId,
-      { $set: update },
-      { new: true, select: "notifications" },
-    );
-
+    const user = await userRepo().findOne({ where: { uuid: req.userId! } });
     if (!user) {
       res.status(404).json({ error: "User not found" });
       return;
@@ -47,8 +41,8 @@ export async function updateNotificationPrefs(req: Request, res: Response): Prom
 
     res.json({
       notifications: {
-        productUpdates: user.notifications?.productUpdates ?? false,
-        marketing: user.notifications?.marketing ?? false,
+        productUpdates: typeof productUpdates === "boolean" ? productUpdates : false,
+        marketing: typeof marketing === "boolean" ? marketing : false,
       },
     });
   } catch (e) {

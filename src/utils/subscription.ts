@@ -1,7 +1,7 @@
-import type { IUser, PlanId } from "../models/User.js";
+import { UserEntity, PaymentMethod } from "../entities/user.entity";
 
 export type SubscriptionStatus = {
-  plan: PlanId;
+  plan: string;
   label: string;
   trialActive: boolean;
   trialDaysLeft: number;
@@ -9,16 +9,16 @@ export type SubscriptionStatus = {
   accountCreatedAt: string;
 };
 
-export function getSubscriptionStatus(user: IUser): SubscriptionStatus {
+export function getSubscriptionStatus(user: UserEntity): SubscriptionStatus {
   const now = new Date();
-  const trialEnd = new Date(user.trialEndsAt);
-  const trialActive = user.plan === "free" && trialEnd > now;
+  const trialEnd = user.trialExpiresAt ? new Date(user.trialExpiresAt) : now;
+  const trialActive = user.paymentMethod === PaymentMethod.FREE && trialEnd > now;
   const trialDaysLeft = trialActive
     ? Math.max(0, Math.ceil((trialEnd.getTime() - now.getTime()) / (24 * 60 * 60 * 1000)))
     : 0;
 
   let label: string;
-  if (user.plan === "pro") {
+  if (user.paymentMethod === PaymentMethod.PRO) {
     label = "Pro Plan";
   } else if (trialActive) {
     label = `Free Trial — ${trialDaysLeft} day${trialDaysLeft === 1 ? "" : "s"} left`;
@@ -27,11 +27,11 @@ export function getSubscriptionStatus(user: IUser): SubscriptionStatus {
   }
 
   return {
-    plan: user.plan,
+    plan: user.paymentMethod,
     label,
     trialActive,
     trialDaysLeft,
-    trialEndsAt: user.trialEndsAt.toISOString(),
+    trialEndsAt: trialEnd.toISOString(),
     accountCreatedAt: user.createdAt.toISOString(),
   };
 }

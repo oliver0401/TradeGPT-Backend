@@ -9,8 +9,8 @@ import {
   patchConversation,
   rollbackFromMessage,
   streamMessage,
-} from "../controllers/chatController.js";
-import { requireAuth } from "../middleware/requireAuth.js";
+} from "../controllers/chatController";
+import { requireAuth } from "../middleware/requireAuth";
 
 export const chatRouter = Router();
 

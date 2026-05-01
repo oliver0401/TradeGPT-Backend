@@ -1,5 +1,5 @@
 import type OpenAI from "openai";
-import { getSystemPrompt, type TradeModeId } from "./tradeModes.js";
+import { getSystemPrompt, type TradeModeId } from "./tradeModes";
 
 /**
  * Appended to the mode system prompt so the model reliably uses the full thread.
